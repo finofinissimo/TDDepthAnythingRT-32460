@@ -1,0 +1,491 @@
+import gc
+import os
+import pathlib
+import logging
+import traceback
+
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+import torch
+import torch.onnx
+import tensorrt as trt
+
+TRT_LOGGER = trt.Logger(trt.Logger.VERBOSE)
+
+# Prefer TF32 math on Ampere+ for faster matmul with minimal accuracy impact
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+from polygraphy.backend.trt import (
+    CreateConfig,
+    Profile,
+    engine_from_network,
+    network_from_onnx_path,
+    save_engine,
+)
+
+
+class TDDepthAnythingRTAccelerate:
+    """_summary_"""
+
+    def __init__(
+        self,
+        width: int = 518,
+        height: int = 518,
+        model_name: str = "Depth-Anything-V2",
+        model_type: str = "Base",
+        checkpoints_dir: str = f"{os.getcwd()}/checkpoints",
+    ):
+        """_summary_
+
+        Args:
+                width (int, optional): _description_. Defaults to 518.
+                height (int, optional): _description_. Defaults to 518.
+                model_name (str, optional): _description_. Defaults to 'Depth-Anything-V2'.
+                model_type (str, optional): _description_. Defaults to 'Base'.
+                checkpoints_dir (str, optional): _description_. Defaults to f'{os.getcwd()}/checkpoints'.
+        """
+
+        self.logger: logging.Logger | None = None
+        self.logger = self.setupLogger()
+        self.logger.info("Logger initialized.")
+
+        self._width = self.adjust_image_size(width)
+        self._height = self.adjust_image_size(height)
+        self.image_shape = (3, self.height, self.width)
+        self.model_name = model_name
+        self._model_type = model_type
+        self.model_complete_name = f"{self.model_name}-{self.model_type}-hf"
+        self.model_path = f"depth-anything/{self.model_complete_name}"
+        self.model = None
+        self._checkpoints_dir = checkpoints_dir
+        self.onnx_path = (
+            f"{self.checkpoints_dir}/onnx_models/{self.get_output_name()}.onnx"
+        )
+        self.engine_path = (
+            f"{self.checkpoints_dir}/engines/{self.get_output_name()}.engine"
+        )
+        self.ensure_directories_exist()
+
+    def setupLogger(self) -> logging.Logger:
+        """
+        Setup the logger for the class.
+
+        Returns:
+                logging.Logger: A logger instance to be used within the helper.
+        """
+        isLoggingEnvVarPassed = (
+            True if "TOUCH_APP_LOG_LEVEL" in os.environ.keys() else False
+        )
+        logLevel = os.environ["TOUCH_APP_LOG_LEVEL"] if isLoggingEnvVarPassed else 10
+
+        logger = logging.getLogger("TDAppLogger.TDDepthAnythingRTAccelerate")
+        logger.setLevel(logLevel)
+        # See if there is a streamhandler, otherwise, add one
+        # See if the parent exist, and only add an handler in that case, otherwise the
+        # logger will propagate to the root logger and a handler might already be available.
+        if not logger.hasHandlers():
+            myHandler = logging.StreamHandler()
+            myFormatter = logging.Formatter(
+                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+            )
+            myHandler.setFormatter(myFormatter)
+            logger.addHandler(myHandler)
+
+        logger.debug("Logger setup successfully")
+        return logger
+
+    def ensure_directories_exist(self):
+        """
+        Ensure that the required directories for ONNX models and TensorRT engines exist.
+        """
+        os.makedirs(f"{self.checkpoints_dir}/onnx_models", exist_ok=True)
+        os.makedirs(f"{self.checkpoints_dir}/engines", exist_ok=True)
+
+    def free_acc_mem(self):
+        """_summary_"""
+        if torch.cuda.is_available() and torch.cuda.memory_allocated() > 0:
+            self.logger.info("Clearing GPU memory cache.")
+            torch.cuda.empty_cache()
+
+        if gc.isenabled():
+            self.logger.info("Performing garbage collection.")
+            gc.collect()
+
+    def update_engine_paths(self):
+        """_summary_"""
+        self.onnx_path = (
+            f"{self.checkpoints_dir}/onnx_models/{self.get_output_name()}.onnx"
+        )
+        self.engine_path = (
+            f"{self.checkpoints_dir}/engines/{self.get_output_name()}.engine"
+        )
+
+    @property
+    def model_type(self):
+        """_summary_
+
+        Returns:
+                _type_: _description_
+        """
+        return self._model_type
+
+    @model_type.setter
+    def model_type(self, value):
+        """_summary_
+
+        Args:
+                value (_type_): _description_
+        """
+        self._model_type = value
+        self.model_complete_name = f"{self.model_name}-{self.model_type}-hf"
+        self.model_path = f"depth-anything/{self.model_complete_name}"
+        self.update_engine_paths()
+
+    @property
+    def width(self):
+        """_summary_
+
+        Returns:
+                _type_: _description_
+        """
+        return self._width
+
+    @width.setter
+    def width(self, value):
+        """_summary_
+
+        Args:
+                value (_type_): _description_
+        """
+        self._width = self.adjust_image_size(value)
+        self.image_shape = (3, self.height, self.width)
+        self.update_engine_paths()
+
+    @property
+    def height(self):
+        """_summary_
+
+        Returns:
+                _type_: _description_
+        """
+        return self._height
+
+    @height.setter
+    def height(self, value):
+        """_summary_
+
+        Args:
+                value (_type_): _description_
+        """
+        self._height = self.adjust_image_size(value)
+        self.image_shape = (3, self.height, self.width)
+        self.update_engine_paths()
+
+    @property
+    def checkpoints_dir(self):
+        """_summary_
+
+        Returns:
+                _type_: _description_
+        """
+        return self._checkpoints_dir
+
+    @checkpoints_dir.setter
+    def checkpoints_dir(self, value):
+        """_summary_
+
+        Args:
+                value (_type_): _description_
+        """
+        self._checkpoints_dir = value
+        self.update_engine_paths()
+        self.ensure_directories_exist()
+
+    def adjust_image_size(self, image_size):
+        """_summary_
+
+        Args:
+                image_size (_type_): _description_
+
+        Returns:
+                _type_: _description_
+        """
+        patch_size = 14
+        adjusted_size = (image_size // patch_size) * patch_size
+
+        if image_size % patch_size != 0:
+            adjusted_size += patch_size
+
+        self.logger.info(f"Adjusted image size from {image_size} to {adjusted_size}")
+        return int(adjusted_size)
+
+    def get_cached_model_dir(self) -> pathlib.Path | None:
+        """
+        Return the most recent local snapshot for the model if it exists.
+        """
+        repo_dir = (
+            pathlib.Path(self.checkpoints_dir)
+            / f"models--{self.model_path.replace('/', '--')}"
+        )
+        snapshot_root = repo_dir / "snapshots"
+        if snapshot_root.exists():
+            snapshots = [p for p in snapshot_root.iterdir() if p.is_dir()]
+            if snapshots:
+                return max(snapshots, key=lambda p: p.stat().st_mtime)
+        return None
+
+    def is_engine_built(self) -> bool:
+        """Return True if the TensorRT engine already exists on disk."""
+        return pathlib.Path(self.engine_path).exists()
+
+    def validate_engine(self) -> bool:
+        """
+        Try to deserialize the generated engine to ensure it is usable.
+        """
+        engine_file = pathlib.Path(self.engine_path)
+        if not engine_file.exists() or engine_file.stat().st_size == 0:
+            return False
+        try:
+            with open(engine_file, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
+                engine = runtime.deserialize_cuda_engine(f.read())
+                return engine is not None
+        except Exception as e:
+            self.logger.error(
+                f"Engine validation failed: {e}\n{traceback.format_exc()}"
+            )
+            return False
+
+    def get_output_name(self):
+        """_summary_
+
+        Returns:
+                _type_: _description_
+        """
+        return f"{self.model_complete_name}_{self.width}x{self.height}"
+
+    def load_model(self):
+        """
+        Load the model using the specified model name and path.
+        """
+        if self.model is not None:
+            self.logger.info("Model already loaded in memory, skipping download.")
+            return self.model
+
+        cached_dir = self.get_cached_model_dir()
+        if cached_dir:
+            self.logger.info(f"Loading cached model from {cached_dir}")
+        else:
+            self.logger.info(f"Loading model: {self.model_name} from {self.model_path}")
+
+        try:
+            if cached_dir:
+                self.model = AutoModelForDepthEstimation.from_pretrained(
+                    cached_dir, local_files_only=True, cache_dir=self.checkpoints_dir
+                )
+            else:
+                self.model = AutoModelForDepthEstimation.from_pretrained(
+                    self.model_path, cache_dir=self.checkpoints_dir
+                )
+            self.logger.info(f"Model loaded successfully.")
+            return self.model
+        except Exception as e:
+            self.logger.error(f"Failed to load model: {e}\n{traceback.format_exc()}")
+            self.model = None
+            return None
+
+    def unload_model(self):
+        """_summary_"""
+        self.model = None
+        self.free_acc_mem()
+
+    def accelerate(self, model=None):
+        """Build TensorRT engine with version compatibility."""
+        self.logger.info(f"Accelerating, image shape is {self.width}x{self.height}")
+
+        def gpu_supports_tf32() -> bool:
+            if not torch.cuda.is_available():
+                self.logger.warning("CUDA is not available; skipping TF32 enablement.")
+                return False
+            capability = torch.cuda.get_device_capability()
+            sm_version = capability[0] * 10 + capability[1]
+            if sm_version < 80:
+                self.logger.warning(
+                    f"GPU compute capability sm{capability[0]}{capability[1]} detected; TF32 requires SM80+. Proceeding without TF32."
+                )
+                return False
+            self.logger.info(
+                f"GPU compute capability sm{capability[0]}{capability[1]} detected (SM80+); TF32 enabled."
+            )
+            return True
+
+        try:
+            # Check if engine already exists and is valid
+            if self.is_engine_built():
+                if self.validate_engine():
+                    self.logger.info(
+                        f"Existing TensorRT engine found at {self.engine_path}; skipping acceleration."
+                    )
+                    return
+                else:
+                    self.logger.warning(
+                        f"Existing engine at {self.engine_path} is invalid; rebuilding."
+                    )
+                    pathlib.Path(self.engine_path).unlink(missing_ok=True)
+
+            if model is None:
+                model = self.model if self.model else self.load_model()
+
+            if model is None:
+                self.logger.error("Model is not loaded; cannot accelerate.")
+                return
+
+            model.eval()
+
+            # Define dummy input data
+            dummy_input = torch.ones(self.image_shape).unsqueeze(0)
+
+            # Export to ONNX if not exists
+            if not pathlib.Path(self.onnx_path).exists():
+                if not os.path.exists(os.path.dirname(self.onnx_path)):
+                    os.makedirs(os.path.dirname(self.onnx_path), exist_ok=True)
+
+                # Use opset 17 for better compatibility
+                opset_version = 17
+                try:
+                    torch.onnx.export(
+                        model,
+                        dummy_input,
+                        self.onnx_path,
+                        opset_version=opset_version,
+                        input_names=["input"],
+                        output_names=["output"],
+                        verbose=True,
+                        export_params=True,
+                        do_constant_folding=True,
+                    )
+                    self.logger.info(
+                        f"Model exported to {self.onnx_path} with opset {opset_version}"
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        f"Export with opset {opset_version} failed: {e}"
+                    )
+                    # Fallback to opset 14
+                    torch.onnx.export(
+                        model,
+                        dummy_input,
+                        self.onnx_path,
+                        opset_version=14,
+                        input_names=["input"],
+                        output_names=["output"],
+                        verbose=True,
+                    )
+                    self.logger.info(
+                        f"Model exported to {self.onnx_path} with opset 14 (fallback)"
+                    )
+
+                del dummy_input
+
+            # Build TensorRT engine
+            if not pathlib.Path(self.engine_path).exists():
+                if not os.path.exists(os.path.dirname(self.engine_path)):
+                    os.makedirs(os.path.dirname(self.engine_path), exist_ok=True)
+
+                self.logger.info(
+                    f"Building TensorRT engine for {self.onnx_path}: {self.engine_path}"
+                )
+
+                p = Profile()
+                batch_input_shape = (1,) + self.image_shape
+                p.add(
+                    "input",
+                    min=batch_input_shape,
+                    opt=batch_input_shape,
+                    max=batch_input_shape,
+                )
+                self.logger.info("Created engine profile.")
+
+                # --- TensorRT 11.2 compatibility ---
+                trt_version = trt.__version__
+                self.logger.info(f"TensorRT version: {trt_version}")
+
+                # Create config compatible with TensorRT 11.2
+                config_kwargs = {
+                    "refittable": False,
+                    "profiles": [p],
+                    "load_timing_cache": None,
+                }
+
+                # Check if fp16 is supported in this TensorRT version
+                if not trt_version.startswith("11."):
+                    # For TensorRT 10.x and newer
+                    config_kwargs["fp16"] = True
+                    self.logger.info("FP16 enabled for TensorRT 10+")
+                else:
+                    self.logger.info(
+                        "FP16 will be set via builder config for TensorRT 11.x"
+                    )
+
+                config = CreateConfig(**config_kwargs)
+
+                # Handle TF32
+                if gpu_supports_tf32():
+                    try:
+                        # Try different ways to set TF32
+                        if hasattr(config, "set_flag"):
+                            config.set_flag(trt.BuilderFlag.TF32)
+                            self.logger.info("TensorRT TF32 flag set via set_flag.")
+                        elif hasattr(config, "builder_config") and hasattr(
+                            config.builder_config, "set_flag"
+                        ):
+                            config.builder_config.set_flag(trt.BuilderFlag.TF32)
+                            self.logger.info(
+                                "TensorRT TF32 flag set via builder_config."
+                            )
+                        else:
+                            # For TensorRT 11.x, try direct builder access
+                            self.logger.info("Attempting to set TF32 via builder")
+                            # We'll handle this inside the engine build if needed
+                    except Exception as e:
+                        self.logger.warning(f"Unable to set TensorRT TF32 flag: {e}")
+
+                self.logger.info("Building engine from ONNX...")
+
+                # Build the engine
+                engine = engine_from_network(
+                    network_from_onnx_path(
+                        self.onnx_path, flags=[trt.OnnxParserFlag.NATIVE_INSTANCENORM]
+                    ),
+                    config=config,
+                    save_timing_cache=None,
+                )
+
+                self.logger.info(f"Built TensorRT engine from ONNX file.")
+                save_engine(engine, path=self.engine_path)
+                self.logger.info(f"Saved TensorRT engine to file.")
+
+                # Clear memory
+                del engine
+                self.model = None
+
+            self.free_acc_mem()
+
+            if not self.validate_engine():
+                self.logger.error(
+                    f"Engine validation failed for {self.engine_path}; removing corrupted file."
+                )
+                pathlib.Path(self.engine_path).unlink(missing_ok=True)
+                return
+
+            self.logger.info(f"Finished building TensorRT engine: {self.engine_path}")
+
+        except Exception as e:
+            self.logger.error(
+                f"Error during acceleration: {e}\n{traceback.format_exc()}"
+            )
+            # Clean up on failure
+            if pathlib.Path(self.onnx_path).exists():
+                self.logger.info(
+                    f"ONNX file preserved at {self.onnx_path} for debugging"
+                )
+            raise

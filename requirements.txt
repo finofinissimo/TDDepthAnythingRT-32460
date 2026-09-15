@@ -1,0 +1,11 @@
+tensorrt-cu12
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch
+torchaudio
+torchvision
+huggingface-hub
+polygraphy
+onnx
+onnxscript
+transformers
+
